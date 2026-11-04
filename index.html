@@ -8,6 +8,7 @@
     margin:0;height:100%;background:#08080a;
     display:flex;align-items:center;justify-content:center;
     overflow:hidden;
+    font-family:"Courier New",monospace;
   }
   canvas{
     image-rendering:pixelated;
@@ -15,6 +16,7 @@
     background:#121216;
     box-shadow:0 0 0 3px #2b2b2b, 0 0 60px #000;
     display:block;
+    cursor:default;
   }
 </style>
 </head>
@@ -26,6 +28,8 @@
 /* ============================================================
    TROLLEY PIXEL  —  Level Devil style trap platformer
    Pure HTML5 / CSS3 / JS  •  Volatile memory only
+   + Particles  + Gravestones  + WebAudio  + Level Select
+   + Speedrun Timer / Rage Score  + Double Jump
    ============================================================ */
 
 const cv  = document.getElementById('c');
@@ -56,26 +60,149 @@ const ACCEL    = 0.90;
 const FRIC     = 0.75;
 const JUMP     = 9.20;
 const STEP     = 1 / 60;
+const MAX_PARTICLES = 320;
+
+/* ============================================================
+   AUDIO  —  Web Audio API, zero external files
+   ============================================================ */
+const Sfx = (() => {
+  let actx = null;
+  let muted = false;
+
+  function ctxInit(){
+    if (!actx){
+      try { actx = new (window.AudioContext || window.webkitAudioContext)(); }
+      catch(e){ actx = null; }
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+    return actx;
+  }
+
+  function blip(type, f0, f1, dur, vol, delay){
+    const a = ctxInit();
+    if (!a || muted) return;
+    const t0 = a.currentTime + (delay || 0);
+    const o = a.createOscillator();
+    const g = a.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(Math.max(20, f0), t0);
+    o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t0 + dur);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol, t0 + 0.006);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(a.destination);
+    o.start(t0); o.stop(t0 + dur + 0.03);
+  }
+
+  function noise(dur, vol){
+    const a = ctxInit();
+    if (!a || muted) return;
+    const len = Math.max(1, Math.floor(a.sampleRate * dur));
+    const buf = a.createBuffer(1, len, a.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++){
+      d[i] = (Math.random() * 2 - 1) * (1 - i / len);
+    }
+    const src = a.createBufferSource();
+    src.buffer = buf;
+    const g = a.createGain();
+    g.gain.setValueAtTime(vol, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime + dur);
+    src.connect(g); g.connect(a.destination);
+    src.start();
+  }
+
+  return {
+    unlock(){ ctxInit(); },
+    jump(){ blip('square', 250, 600, 0.09, 0.10); },
+    dblJump(){ blip('square', 420, 950, 0.11, 0.11); },
+    death(){ blip('sawtooth', 340, 50, 0.34, 0.13); noise(0.20, 0.09); },
+    win(){
+      blip('triangle', 523, 523, 0.10, 0.12, 0.00);
+      blip('triangle', 659, 659, 0.10, 0.12, 0.09);
+      blip('triangle', 784, 784, 0.10, 0.12, 0.18);
+      blip('triangle', 1047, 1047, 0.24, 0.13, 0.27);
+    },
+    click(){ blip('square', 880, 460, 0.045, 0.06); },
+    thud(){ blip('triangle', 130, 38, 0.16, 0.14); noise(0.08, 0.05); },
+    whoosh(){ blip('sine', 700, 180, 0.34, 0.09); },
+    ui(){ blip('square', 720, 980, 0.05, 0.05); },
+    toggleMute(){ muted = !muted; return muted; },
+    isMuted(){ return muted; }
+  };
+})();
 
 /* ============================================================
    INPUT
    ============================================================ */
 const keys = Object.create(null);
 let jumpBuffer = 0;
+const mouse = { x: -1, y: -1 };
 
 window.addEventListener('keydown', e => {
   if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space'].includes(e.code)) e.preventDefault();
+  Sfx.unlock();
+
   if (!keys[e.code]) {
     if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') jumpBuffer = 7;
+    if (e.code === 'KeyM') Sfx.toggleMute();
+
     if (e.code === 'KeyR') {
-      if (gameState === 'victory') { gameState = 'play'; levelIndex = 0; deaths = 0; buildLevel(); }
-      else { kill(); }
+      if (gameState === 'victory') restartRun();
+      else if (gameState === 'play') kill();
+    }
+
+    if (e.code === 'Escape' || e.code === 'KeyL') {
+      if (gameState === 'select'){
+        gameState = 'play';
+        Sfx.ui();
+      } else if (gameState === 'play' || gameState === 'victory'){
+        if (e.shiftKey) unlocked = LEVELS.length;   // testing cheat
+        gameState = 'select';
+        Sfx.ui();
+      }
+    }
+
+    if (gameState === 'select'){
+      let picked = -1;
+      if (e.code.startsWith('Digit')){
+        const d = parseInt(e.code.slice(5), 10);
+        picked = (d === 0) ? 9 : d - 1;
+      } else if (e.code.startsWith('Numpad')){
+        const d = parseInt(e.code.slice(6), 10);
+        picked = (d === 0) ? 9 : d - 1;
+      }
+      if (picked >= 0 && picked < unlocked) startLevel(picked);
     }
   }
   keys[e.code] = true;
 }, { passive:false });
 
 window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function mousePos(e){
+  const r = cv.getBoundingClientRect();
+  return {
+    x: (e.clientX - r.left) * (W / r.width),
+    y: (e.clientY - r.top)  * (H / r.height)
+  };
+}
+cv.addEventListener('mousemove', e => {
+  const p = mousePos(e);
+  mouse.x = p.x; mouse.y = p.y;
+});
+cv.addEventListener('mousedown', e => {
+  Sfx.unlock();
+  if (gameState !== 'select') return;
+  const p = mousePos(e);
+  for (let i = 0; i < LEVELS.length; i++){
+    const r = lsRect(i);
+    if (p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h){
+      if (i < unlocked) startLevel(i);
+      return;
+    }
+  }
+});
 
 /* ============================================================
    UTIL
@@ -110,15 +237,13 @@ const LEVELS = [];
 (function(){
   const g = newGrid();
   fillR(g, 0, 16, 31, 17);
-  fillR(g, 14, 16, 16, 17, '.');          // the innocent-looking gap
+  fillR(g, 14, 16, 16, 17, '.');
   LEVELS.push({
-    name: 'THE FALSE SECURITY',
+    name: 'FALSE SECURITY',
     grid: gridStr(g),
     spawn: { x: 40, y: 304 },
     door:  { x: 560, y: 288 },
-    traps: [
-      { type:'jump', x: 340, baseY: 320, w: 20, h: 26, radius: 95 }
-    ]
+    traps: [ { type:'jump', x: 340, baseY: 320, w: 20, h: 26, radius: 95 } ]
   });
 })();
 
@@ -126,21 +251,16 @@ const LEVELS = [];
 (function(){
   const g = newGrid();
   fillR(g, 0, 16, 31, 17);
-  fillR(g, 23, 16, 25, 17, '.');          // hole for the drop-floor
+  fillR(g, 23, 16, 25, 17, '.');
   LEVELS.push({
-    name: 'THE SHRINKING CORRIDOR',
+    name: 'SHRINKING HALL',
     grid: gridStr(g),
     spawn: { x: 40, y: 304 },
     door:  { x: 580, y: 288 },
     traps: [
-      // intimidation crusher that slams behind you
-      { type:'crush', x: 100, w: 100, h: 220, upY: -220, downY: 100,
-        triggerX: 260, once: true },
-      // the real, cycling crusher in front
-      { type:'crush', x: 340, w: 60, h: 160, upY: 80, downY: 160,
-        triggerX: 200, once: false },
-      // the floor that lies
-      { type:'drop', x: 460, y: 320, w: 60, h: 40, delay: 0.35 }
+      { type:'crush', x: 100, w: 100, h: 220, upY: -220, downY: 100, triggerX: 260, once: true },
+      { type:'crush', x: 340, w: 60,  h: 160, upY: 80,   downY: 160, triggerX: 200, once: false },
+      { type:'drop',  x: 460, y: 320, w: 60, h: 40, delay: 0.35 }
     ]
   });
 })();
@@ -150,30 +270,28 @@ const LEVELS = [];
   const g = newGrid();
   fillR(g, 0, 16, 31, 17);
   fillR(g, 14, 16, 16, 17, '.');
-  fillR(g, 20, 13, 22, 13);               // P1
-  fillR(g, 24, 10, 26, 10);               // P2
-  fillR(g, 28,  7, 31,  7);               // P3 (door's new home)
+  fillR(g, 20, 13, 22, 13);
+  fillR(g, 24, 10, 26, 10);
+  fillR(g, 28,  7, 31,  7);
   g[15][9]  = '^';
   g[15][10] = '^';
   LEVELS.push({
-    name: 'THE DOOR THAT RUNS AWAY',
+    name: 'RUNAWAY DOOR',
     grid: gridStr(g),
     spawn: { x: 40, y: 304 },
     door:  { x: 560, y: 288 },
     doorFlees: { x: 580, y: 108 },
-    traps: [
-      { type:'jump', x: 360, baseY: 320, w: 20, h: 26, radius: 85 }
-    ]
+    traps: [ { type:'jump', x: 360, baseY: 320, w: 20, h: 26, radius: 85 } ]
   });
 })();
 
 /* ---------- STAGE 4 : THE INVISIBLE MAZE ---------- */
 (function(){
   const g = newGrid();
-  fillR(g, 0, 16, 5, 17);                 // start ledge
-  fillR(g, 27, 16, 31, 17);               // end ledge
+  fillR(g, 0, 16, 5, 17);
+  fillR(g, 27, 16, 31, 17);
   LEVELS.push({
-    name: 'THE INVISIBLE MAZE',
+    name: 'INVISIBLE MAZE',
     grid: gridStr(g),
     spawn: { x: 40, y: 304 },
     door:  { x: 580, y: 288 },
@@ -211,10 +329,10 @@ const LEVELS = [];
 /* ---------- STAGE 6 : REVERSE GRAVITY ---------- */
 (function(){
   const g = newGrid();
-  fillR(g, 0, 0, 31, 1);                  // ceiling
-  fillR(g, 18, 0, 20, 1, '.');            // ceiling gap A
-  fillR(g, 25, 0, 26, 1, '.');            // ceiling gap B
-  fillR(g, 0, 16, 12, 17);                // floor (left only)
+  fillR(g, 0, 0, 31, 1);
+  fillR(g, 18, 0, 20, 1, '.');
+  fillR(g, 25, 0, 26, 1, '.');
+  fillR(g, 0, 16, 12, 17);
   g[2][22] = 'v';
   g[2][23] = 'v';
   LEVELS.push({
@@ -222,9 +340,7 @@ const LEVELS = [];
     grid: gridStr(g),
     spawn: { x: 40, y: 304 },
     door:  { x: 580, y: 40 },
-    traps: [
-      { type:'grav', x: 140, y: 240, w: 60, h: 80, dir: -1 }
-    ]
+    traps: [ { type:'grav', x: 140, y: 240, w: 60, h: 80, dir: -1 } ]
   });
 })();
 
@@ -243,9 +359,7 @@ const LEVELS = [];
     spawn: { x: 560, y: 304 },
     door:  { x: 20, y: 288 },
     invertControls: true,
-    traps: [
-      { type:'jump', x: 460, baseY: 320, w: 20, h: 26, radius: 90 }
-    ]
+    traps: [ { type:'jump', x: 460, baseY: 320, w: 20, h: 26, radius: 90 } ]
   });
 })();
 
@@ -255,7 +369,7 @@ const LEVELS = [];
   fillR(g, 0, 16, 1, 17);
   fillR(g, 22, 16, 31, 17);
   LEVELS.push({
-    name: 'COLLAPSING BRIDGE',
+    name: 'COLLAPSE BRIDGE',
     grid: gridStr(g),
     spawn: { x: 20, y: 304 },
     door:  { x: 580, y: 288 },
@@ -272,16 +386,16 @@ const LEVELS = [];
 /* ---------- STAGE 9 : THE FAKE BRIDGE ---------- */
 (function(){
   const g = newGrid();
-  fillR(g, 0, 16, 13, 17);                // left ground
-  fillR(g, 21, 16, 31, 17);               // right ground
-  fillR(g, 15, 13, 17, 13);               // the real platform
+  fillR(g, 0, 16, 13, 17);
+  fillR(g, 21, 16, 31, 17);
+  fillR(g, 15, 13, 17, 13);
   LEVELS.push({
     name: 'THE FAKE BRIDGE',
     grid: gridStr(g),
     spawn: { x: 40, y: 304 },
     door:  { x: 580, y: 288 },
     traps: [
-      { type:'fake', x: 280, y: 300, w: 140, h: 20 },   // lies
+      { type:'fake', x: 280, y: 300, w: 140, h: 20 },
       { type:'jump', x: 500, baseY: 320, w: 20, h: 26, radius: 90 }
     ]
   });
@@ -292,9 +406,9 @@ const LEVELS = [];
   const g = newGrid();
   fillR(g, 0, 16, 17, 17);
   fillR(g, 21, 16, 31, 17);
-  fillR(g, 21, 13, 23, 13);               // A
-  fillR(g, 25, 10, 27, 10);               // B
-  fillR(g, 28,  7, 31,  7);               // C
+  fillR(g, 21, 13, 23, 13);
+  fillR(g, 25, 10, 27, 10);
+  fillR(g, 28,  7, 31,  7);
   g[15][8] = '^';
   LEVELS.push({
     name: 'NO MORE TRUST',
@@ -303,10 +417,9 @@ const LEVELS = [];
     door:  { x: 580, y: 288 },
     doorFlees: { x: 580, y: 108 },
     traps: [
-      { type:'crush', x: 240, w: 60, h: 160, upY: 80, downY: 160,
-        triggerX: 180, once: false },
-      { type:'drop', x: 360, y: 320, w: 60, h: 40, delay: 0.30 },
-      { type:'jump', x: 500, baseY: 320, w: 20, h: 26, radius: 85 }
+      { type:'crush', x: 240, w: 60, h: 160, upY: 80, downY: 160, triggerX: 180, once: false },
+      { type:'drop',  x: 360, y: 320, w: 60, h: 40, delay: 0.30 },
+      { type:'jump',  x: 500, baseY: 320, w: 20, h: 26, radius: 85 }
     ]
   });
 })();
@@ -316,21 +429,116 @@ const LEVELS = [];
    ============================================================ */
 let levelIndex = 0;
 let deaths     = 0;
+let sessionTime = 0;          // seconds
+let unlocked   = 1;           // number of unlocked stages
+let gameState  = 'play';      // play | select | victory
+let flash      = 0;
+let flashCol   = '#ff2a2a';
+let shake      = 0;
 let level      = null;
 let door       = null;
-let gameState  = 'play';     // play | victory
-let flash      = 0;
-let shake      = 0;
 let staticSolids = [];
 let SOLIDS = [];
+
+const graveStore = {};        // levelIndex -> [{x,y}]
+const particles  = [];
 
 const player = {
   x:0, y:0, vx:0, vy:0,
   w:14, h:16,
   gdir:1,
   grounded:false,
-  coyote:0
+  coyote:0,
+  jumpsLeft:2
 };
+
+function gravesFor(i){
+  if (!graveStore[i]) graveStore[i] = [];
+  return graveStore[i];
+}
+
+/* ============================================================
+   PARTICLES
+   ============================================================ */
+function spawnGibs(x, y, n){
+  for (let i = 0; i < n; i++){
+    if (particles.length >= MAX_PARTICLES) break;
+    const ang = Math.random() * Math.PI * 2;
+    const spd = 1.4 + Math.random() * 4.6;
+    particles.push({
+      x: x, y: y,
+      vx: Math.cos(ang) * spd,
+      vy: Math.sin(ang) * spd - 2.2,
+      life: 0.55 + Math.random() * 0.65,
+      maxLife: 1.2,
+      size: Math.random() < 0.35 ? 4 : 2,
+      color: Math.random() < 0.28 ? '#8ff2ff' : '#22cce8'
+    });
+  }
+}
+
+function spawnBurst(x, y, n){
+  for (let i = 0; i < n; i++){
+    if (particles.length >= MAX_PARTICLES) break;
+    const ang = -Math.PI/2 + (Math.random() - 0.5) * 2.4;
+    const spd = 1.0 + Math.random() * 2.4;
+    particles.push({
+      x: x, y: y,
+      vx: Math.cos(ang) * spd,
+      vy: Math.sin(ang) * spd,
+      life: 0.28 + Math.random() * 0.22,
+      maxLife: 0.5,
+      size: 2,
+      color: '#a9f4ff'
+    });
+  }
+}
+
+function spawnDust(x, y, n, col){
+  for (let i = 0; i < n; i++){
+    if (particles.length >= MAX_PARTICLES) break;
+    const ang = Math.random() * Math.PI * 2;
+    const spd = 0.8 + Math.random() * 2.2;
+    particles.push({
+      x: x + (Math.random()-0.5)*10,
+      y: y,
+      vx: Math.cos(ang) * spd,
+      vy: Math.sin(ang) * spd - 1.0,
+      life: 0.3 + Math.random() * 0.3,
+      maxLife: 0.6,
+      size: 2,
+      color: col || '#8a8a96'
+    });
+  }
+}
+
+function updateParticles(){
+  for (let i = particles.length - 1; i >= 0; i--){
+    const p = particles[i];
+    p.vy += 0.42;
+    p.x  += p.vx;
+    p.y  += p.vy;
+    p.life -= STEP;
+
+    const box = { x:p.x, y:p.y, w:p.size, h:p.size };
+    for (let s = 0; s < SOLIDS.length; s++){
+      const so = SOLIDS[s];
+      if (!overlap(box, so)) continue;
+      if (p.vy > 0){
+        p.y = so.y - p.size;
+        p.vy *= -0.45;
+        p.vx *= 0.82;
+      } else if (p.vy < 0){
+        p.y = so.y + so.h;
+        p.vy *= -0.40;
+      }
+      break;
+    }
+    if (p.y > H - 2){ p.y = H - 2; p.vy *= -0.40; p.vx *= 0.85; }
+
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
 
 /* ============================================================
    LEVEL BUILD
@@ -398,32 +606,72 @@ function buildLevel(){
   player.gdir = 1;
   player.grounded = false;
   player.coyote = 0;
+  player.jumpsLeft = 2;
   jumpBuffer = 0;
-
-  flash = 0.18;
-  shake = 0;
 }
 
 /* ============================================================
-   DEATH / WIN
+   DEATH / WIN / START
    ============================================================ */
 function kill(){
   if (gameState !== 'play') return;
+
   deaths++;
+
+  const cx = player.x + player.w/2;
+  const cy = player.y + player.h/2;
+
+  spawnGibs(cx, cy, 16);
+
+  const gr = gravesFor(levelIndex);
+  gr.push({ x: cx, y: Math.min(player.y + player.h, H - 6) });
+  if (gr.length > 120) gr.shift();
+
+  Sfx.death();
+
   buildLevel();
-  flash = 0.32;
-  shake = 12;
+
+  flash = 0.30;
+  flashCol = '#ff2a2a';
+  shake = 16;
 }
 
 function win(){
   if (gameState !== 'play') return;
+
+  Sfx.win();
+  spawnGibs(door.x + door.w/2, door.y + door.h/2, 18);
+
+  unlocked = Math.max(unlocked, levelIndex + 2);
+
   levelIndex++;
   if (levelIndex >= LEVELS.length){
     gameState = 'victory';
     return;
   }
   buildLevel();
-  flash = 0.16;
+  flash = 0.14;
+  flashCol = '#00ff66';
+  shake = 4;
+}
+
+function startLevel(i){
+  levelIndex = i;
+  gameState = 'play';
+  particles.length = 0;
+  buildLevel();
+  Sfx.ui();
+}
+
+function restartRun(){
+  deaths = 0;
+  sessionTime = 0;
+  levelIndex = 0;
+  for (const k in graveStore) delete graveStore[k];
+  particles.length = 0;
+  gameState = 'play';
+  buildLevel();
+  Sfx.ui();
 }
 
 /* ============================================================
@@ -463,6 +711,25 @@ function moveY(dy){
 }
 
 /* ============================================================
+   DOUBLE JUMP
+   ============================================================ */
+function doJump(isAir){
+  player.vy = -JUMP * player.gdir * (isAir ? 0.90 : 1.0);
+  player.grounded = false;
+  player.coyote = 0;
+  player.jumpsLeft = isAir ? 0 : 1;
+  jumpBuffer = 0;
+
+  if (isAir){
+    Sfx.dblJump();
+    const fy = player.gdir > 0 ? player.y + player.h : player.y;
+    spawnBurst(player.x + player.w/2, fy, 8);
+  } else {
+    Sfx.jump();
+  }
+}
+
+/* ============================================================
    TRAPS
    ============================================================ */
 function pressButton(id){
@@ -482,6 +749,7 @@ function pressButton(id){
   }
   if (seq.length === target.length){
     level.doorOpen = true;
+    Sfx.win();
   }
 }
 
@@ -497,7 +765,10 @@ function updateTraps(dt){
         if (!t.triggered && overlap(player, t)){ t.triggered = true; t.timer = 0; }
         if (t.triggered && !t.falling){
           t.timer += dt;
-          if (t.timer >= (t.delay !== undefined ? t.delay : 0.35)) t.falling = true;
+          if (t.timer >= (t.delay !== undefined ? t.delay : 0.35)){
+            t.falling = true;
+            Sfx.click();
+          }
         }
         if (t.falling){
           t.vy = Math.min(t.vy + GRAV * 1.4, 16);
@@ -518,7 +789,7 @@ function updateTraps(dt){
 
         if (t.state === 'idle'){
           t.h01 = 0;
-          if (d < R){ t.state = 'up'; t.timer = 0; }
+          if (d < R){ t.state = 'up'; t.timer = 0; Sfx.click(); }
         } else if (t.state === 'up'){
           t.timer += dt;
           t.h01 = Math.min(1, t.timer / 0.12);
@@ -542,7 +813,10 @@ function updateTraps(dt){
           const pcy = player.y + player.h/2;
           const cx  = t.x + t.w/2;
           const cy  = t.y + t.h/2;
-          if (Math.hypot(pcx - cx, pcy - cy) < 115) t.revealed = true;
+          if (Math.hypot(pcx - cx, pcy - cy) < 115){
+            t.revealed = true;
+            spawnDust(cx, cy, 5, '#c0c0c0');
+          }
         }
         break;
       }
@@ -558,6 +832,11 @@ function updateTraps(dt){
           t.timer += dt;
           if (t.timer > 1.8){ t.phase = 'slam'; t.timer = 0; }
         } else if (t.phase === 'slam'){
+          if (t.timer === 0){
+            Sfx.thud();
+            shake = Math.max(shake, 9);
+            spawnDust(t.x + t.w/2, t.downY + t.h, 8, '#7a3a3a');
+          }
           t.timer += dt;
           const p = Math.min(1, t.timer / 0.10);
           t.y = t.upY + (t.downY - t.upY) * (p * p);
@@ -581,6 +860,8 @@ function updateTraps(dt){
             player.gdir = t.dir;
             player.vy = 0;
             player.grounded = false;
+            Sfx.whoosh();
+            spawnBurst(player.x + player.w/2, player.y + player.h/2, 6);
           }
         }
         break;
@@ -591,6 +872,7 @@ function updateTraps(dt){
         const on = overlap(player, t);
         if (on && !t.pressed){
           t.pressed = true;
+          Sfx.ui();
           pressButton(t.id);
         } else if (!on){
           t.pressed = false;
@@ -603,6 +885,8 @@ function updateTraps(dt){
         if (!t.gone && overlap(player, { x:t.x, y:t.y, w:24, h:32 })){
           t.gone = true;
           t.timer = 0;
+          Sfx.click();
+          spawnDust(t.x + 12, t.y + 16, 8, '#00ff66');
         }
         if (t.gone) t.timer += dt;
         break;
@@ -639,6 +923,7 @@ function checkDoor(){
     door.sx = door.x;  door.sy = door.y;
     door.tx = door.flee.x;
     door.ty = door.flee.y;
+    Sfx.whoosh();
     return;
   }
   win();
@@ -650,6 +935,7 @@ function checkDoor(){
 function update(){
   const dt = STEP;
   level.t += dt;
+  sessionTime += dt;
 
   if (flash > 0) flash -= dt;
   if (shake > 0)  shake *= 0.86;
@@ -687,15 +973,16 @@ function update(){
   if (player.gdir > 0) player.vy = Math.min(player.vy, MAXFALL);
   else                 player.vy = Math.max(player.vy, -MAXFALL);
 
-  /* --- jump --- */
+  /* --- jump / double jump --- */
   if (jumpBuffer > 0) jumpBuffer--;
   if (player.coyote > 0) player.coyote--;
 
-  if (jumpBuffer > 0 && (player.grounded || player.coyote > 0)){
-    player.vy = -JUMP * player.gdir;
-    player.grounded = false;
-    player.coyote = 0;
-    jumpBuffer = 0;
+  if (jumpBuffer > 0){
+    if (player.grounded || player.coyote > 0){
+      doJump(false);
+    } else if (player.jumpsLeft > 0){
+      doJump(true);
+    }
   }
 
   /* variable jump cut-off */
@@ -706,7 +993,10 @@ function update(){
   player.grounded = false;
   moveX(player.vx);
   moveY(player.vy);
-  if (player.grounded) player.coyote = 6;
+  if (player.grounded){
+    player.coyote = 6;
+    player.jumpsLeft = 2;
+  }
 
   player.x = clamp(player.x, 0, W - player.w);
 
@@ -718,10 +1008,33 @@ function update(){
 
   checkHazards();
   checkDoor();
+
+  /* --- particles --- */
+  updateParticles();
 }
 
 /* ============================================================
-   RENDER
+   LEVEL SELECT LAYOUT
+   ============================================================ */
+const LS = { cols:5, rows:2, cw:92, ch:80, gapX:16, gapY:18, x0:0, y0:0 };
+(function initLS(){
+  const w = LS.cols * LS.cw + (LS.cols - 1) * LS.gapX;
+  const h = LS.rows * LS.ch + (LS.rows - 1) * LS.gapY;
+  LS.x0 = (W - w) / 2;
+  LS.y0 = (H - h) / 2 + 8;
+})();
+
+function lsRect(i){
+  const c = i % LS.cols, r = Math.floor(i / LS.cols);
+  return {
+    x: LS.x0 + c * (LS.cw + LS.gapX),
+    y: LS.y0 + r * (LS.ch + LS.gapY),
+    w: LS.cw, h: LS.ch
+  };
+}
+
+/* ============================================================
+   RENDER HELPERS
    ============================================================ */
 function drawBlock(s, color){
   ctx.fillStyle = color || '#c0c0c0';
@@ -756,6 +1069,19 @@ function drawSpike(x, y, w, h, dir){
   ctx.fillRect(x, dir > 0 ? y + h - 2 : y, w, 2);
 }
 
+function drawGrave(x, y){
+  const gx = Math.round(x - 5);
+  const gy = Math.round(y - 13);
+  ctx.fillStyle = '#4e4e5a';
+  ctx.fillRect(gx, gy + 2, 10, 11);
+  ctx.fillRect(gx + 1, gy, 8, 3);
+  ctx.fillStyle = '#6a6a78';
+  ctx.fillRect(gx + 1, gy, 8, 2);
+  ctx.fillStyle = '#1c1c22';
+  ctx.fillRect(gx + 4, gy + 4, 2, 7);
+  ctx.fillRect(gx + 2, gy + 6, 6, 2);
+}
+
 function drawPlayer(){
   const p = player;
   ctx.save();
@@ -764,18 +1090,17 @@ function drawPlayer(){
     ctx.scale(1, -1);
     ctx.translate(-(p.x + p.w/2), -(p.y + p.h/2));
   }
-  // body
   ctx.fillStyle = '#22cce8';
   ctx.fillRect(p.x, p.y, p.w, p.h);
   ctx.fillStyle = '#8ff2ff';
   ctx.fillRect(p.x, p.y, p.w, 3);
   ctx.fillStyle = '#0a6a80';
   ctx.fillRect(p.x, p.y + p.h - 3, p.w, 3);
-  // eyes
+
   ctx.fillStyle = '#08161c';
   ctx.fillRect(p.x + 3, p.y + 5, 3, 4);
   ctx.fillRect(p.x + p.w - 6, p.y + 5, 3, 4);
-  // highlight
+
   ctx.fillStyle = 'rgba(255,255,255,0.6)';
   ctx.fillRect(p.x + 3, p.y + 5, 1, 1);
   ctx.fillRect(p.x + p.w - 6, p.y + 5, 1, 1);
@@ -817,6 +1142,9 @@ function drawDoorBody(d, wings){
   ctx.strokeRect(d.x - 2, d.y - 2, d.w + 4, d.h + 4);
 }
 
+/* ============================================================
+   RENDER
+   ============================================================ */
 function render(){
   ctx.save();
   if (shake > 0){
@@ -830,7 +1158,6 @@ function render(){
   ctx.fillStyle = '#121216';
   ctx.fillRect(-30, -30, W + 60, H + 60);
 
-  /* faint grid texture */
   ctx.fillStyle = 'rgba(255,255,255,0.018)';
   for (let y = 0; y < H; y += 40)
     for (let x = 0; x < W; x += 40)
@@ -838,6 +1165,10 @@ function render(){
 
   /* static terrain */
   for (const s of staticSolids) drawBlock(s);
+
+  /* gravestones */
+  const graves = gravesFor(levelIndex);
+  for (let i = 0; i < graves.length; i++) drawGrave(graves[i].x, graves[i].y);
 
   /* traps */
   for (const t of level.traps){
@@ -855,13 +1186,11 @@ function render(){
 
     else if (t.type === 'fake'){
       drawBlock(t, '#c0c0c0');
-      // tell-tale 1px shimmer — the only hint
       ctx.fillStyle = 'rgba(255,255,255,0.10)';
       ctx.fillRect(t.x, t.y + 2, t.w, 1);
     }
 
     else if (t.type === 'jump'){
-      // little nub when hidden
       if (t.h01 <= 0.02){
         ctx.fillStyle = '#5a2020';
         ctx.fillRect(t.x + 4, t.baseY - 3, t.w - 8, 3);
@@ -872,7 +1201,7 @@ function render(){
     }
 
     else if (t.type === 'crush'){
-      if (t.y > -100){
+      if (t.y > -120){
         ctx.fillStyle = '#8a1f1f';
         ctx.fillRect(t.x, t.y, t.w, t.h);
         ctx.fillStyle = '#ff2a2a';
@@ -893,7 +1222,6 @@ function render(){
       ctx.lineWidth = 2;
       ctx.strokeRect(t.x, t.y, t.w, t.h);
 
-      // id pips
       ctx.fillStyle = lit ? '#08160c' : '#8a9a90';
       for (let i = 0; i < t.id; i++){
         ctx.fillRect(t.x + 4 + i * 6, t.y + 2, 3, 2);
@@ -917,16 +1245,13 @@ function render(){
     }
 
     else if (t.type === 'grav'){
-      // completely invisible — that is the point
       ctx.fillStyle = 'rgba(120,60,255,0.05)';
       ctx.fillRect(t.x, t.y, t.w, t.h);
     }
   }
 
   /* static grid hazards */
-  for (const h of level.hazards){
-    drawSpike(h.x, h.y, h.w, h.h, 1);
-  }
+  for (const h of level.hazards) drawSpike(h.x, h.y, h.w, h.h, 1);
 
   /* door */
   if (level.doorOpen) drawDoorBody(door, door.state === 'fleeing');
@@ -934,11 +1259,21 @@ function render(){
   /* player */
   drawPlayer();
 
+  /* particles */
+  for (const p of particles){
+    const a = clamp(p.life / p.maxLife, 0, 1);
+    ctx.globalAlpha = a;
+    ctx.fillStyle = p.color;
+    ctx.fillRect(Math.round(p.x), Math.round(p.y), p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+
   ctx.restore();
 
   /* ---------- HUD ---------- */
   ctx.textBaseline = 'top';
   ctx.font = 'bold 11px "Courier New", monospace';
+  ctx.textAlign = 'left';
 
   ctx.fillStyle = '#c0c0c0';
   ctx.fillText('STAGE ' + String(levelIndex + 1).padStart(2, '0'), 12, 10);
@@ -946,9 +1281,13 @@ function render(){
   ctx.fillStyle = '#ff2a2a';
   ctx.fillText('DEATHS: ' + deaths, 12, 25);
 
-  ctx.fillStyle = '#3f3f4a';
   ctx.textAlign = 'right';
-  ctx.fillText('R = RETRY', W - 12, 10);
+  ctx.fillStyle = '#00ff66';
+  ctx.fillText(fmtTime(sessionTime), W - 12, 10);
+
+  ctx.fillStyle = '#3f3f4a';
+  ctx.fillText('ESC: STAGES   M: ' + (Sfx.isMuted() ? 'SOUND OFF' : 'SOUND ON'), W - 12, 25);
+  ctx.fillText('R: RETRY', W - 12, 40);
   ctx.textAlign = 'left';
 
   /* level name intro */
@@ -958,15 +1297,19 @@ function render(){
     ctx.textAlign = 'center';
     ctx.font = 'bold 16px "Courier New", monospace';
     ctx.fillStyle = '#e8e8f0';
-    ctx.fillText(LEVELS[levelIndex].name, W/2, 60);
+    ctx.fillText(LEVELS[levelIndex].name, W/2, 58);
     ctx.font = 'bold 10px "Courier New", monospace';
     ctx.fillStyle = '#4a4a55';
-    ctx.fillText('STAGE ' + String(levelIndex + 1).padStart(2,'0'), W/2, 84);
+    ctx.fillText('STAGE ' + String(levelIndex + 1).padStart(2,'0'), W/2, 82);
+    if (levelIndex === 0){
+      ctx.fillStyle = '#2f6f7a';
+      ctx.fillText('SPACE = JUMP  •  TAP SPACE TWICE TO JUMP HIGHER', W/2, 100);
+    }
     ctx.globalAlpha = 1;
     ctx.textAlign = 'left';
   }
 
-  /* sequence-fail flash for stage 5 */
+  /* sequence-fail flash */
   if (level.seqFail > 0){
     ctx.fillStyle = `rgba(255,42,42,${level.seqFail * 0.5})`;
     ctx.fillRect(0, 0, W, H);
@@ -974,25 +1317,109 @@ function render(){
 
   /* damage flash */
   if (flash > 0){
-    ctx.fillStyle = `rgba(255,42,42,${Math.min(0.55, flash)})`;
+    const a = Math.min(0.55, flash);
+    ctx.fillStyle = flashCol === '#00ff66'
+      ? `rgba(0,255,102,${a * 0.8})`
+      : `rgba(255,42,42,${a})`;
     ctx.fillRect(0, 0, W, H);
   }
 
-  /* victory */
-  if (gameState === 'victory'){
-    ctx.fillStyle = 'rgba(8,8,10,0.88)';
-    ctx.fillRect(0, 0, W, H);
-    ctx.textAlign = 'center';
-    ctx.font = 'bold 26px "Courier New", monospace';
-    ctx.fillStyle = '#00ff66';
-    ctx.fillText('YOU BEAT THE TROLL', W/2, 130);
-    ctx.font = 'bold 12px "Courier New", monospace';
-    ctx.fillStyle = '#c0c0c0';
-    ctx.fillText('TOTAL DEATHS: ' + deaths, W/2, 172);
-    ctx.fillStyle = '#4a4a55';
-    ctx.fillText('PRESS R TO DO IT ALL AGAIN', W/2, 210);
-    ctx.textAlign = 'left';
+  /* ---------- overlays ---------- */
+  if (gameState === 'select')      drawLevelSelect();
+  else if (gameState === 'victory') drawVictory();
+}
+
+/* ============================================================
+   OVERLAY : LEVEL SELECT
+   ============================================================ */
+function drawLevelSelect(){
+  ctx.fillStyle = 'rgba(8,8,12,0.93)';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center';
+
+  ctx.font = 'bold 20px "Courier New", monospace';
+  ctx.fillStyle = '#e8e8f0';
+  ctx.fillText('SELECT STAGE', W/2, 40);
+
+  ctx.font = 'bold 9px "Courier New", monospace';
+  ctx.fillStyle = '#4a4a55';
+  ctx.fillText('CLICK OR PRESS 1-0   •   ESC TO RESUME', W/2, 66);
+
+  for (let i = 0; i < LEVELS.length; i++){
+    const r = lsRect(i);
+    const open = i < unlocked;
+    const hover = open &&
+      mouse.x >= r.x && mouse.x <= r.x + r.w &&
+      mouse.y >= r.y && mouse.y <= r.y + r.h;
+
+    ctx.fillStyle = open ? (hover ? '#1c2b33' : '#151519') : '#101014';
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = open ? (hover ? '#00ff66' : '#3a3a46') : '#222229';
+    ctx.strokeRect(r.x + 1, r.y + 1, r.w - 2, r.h - 2);
+
+    ctx.font = 'bold 24px "Courier New", monospace';
+    ctx.fillStyle = open ? (hover ? '#00ff66' : '#c0c0c0') : '#2e2e38';
+    ctx.fillText(String(i + 1).padStart(2, '0'), r.x + r.w/2, r.y + 22);
+
+    ctx.font = 'bold 8px "Courier New", monospace';
+    ctx.fillStyle = open ? '#5a5a68' : '#26262e';
+    ctx.fillText(open ? LEVELS[i].name : 'LOCKED', r.x + r.w/2, r.y + 54);
   }
+
+  ctx.font = 'bold 9px "Courier New", monospace';
+  ctx.fillStyle = '#3a3a44';
+  ctx.fillText('HOLD SHIFT WHILE OPENING THIS SCREEN TO UNLOCK ALL (TESTING)', W/2, H - 26);
+
+  ctx.textAlign = 'left';
+}
+
+/* ============================================================
+   OVERLAY : VICTORY
+   ============================================================ */
+function drawVictory(){
+  ctx.fillStyle = 'rgba(8,8,10,0.90)';
+  ctx.fillRect(0, 0, W, H);
+
+  const rageScore = Math.round(deaths * sessionTime);
+
+  ctx.textAlign = 'center';
+
+  ctx.font = 'bold 26px "Courier New", monospace';
+  ctx.fillStyle = '#00ff66';
+  ctx.fillText('YOU BEAT THE TROLL', W/2, 96);
+
+  ctx.font = 'bold 11px "Courier New", monospace';
+  ctx.fillStyle = '#c0c0c0';
+  ctx.fillText('TOTAL DEATHS: ' + deaths, W/2, 152);
+  ctx.fillText('TOTAL TIME:   ' + fmtTime(sessionTime), W/2, 172);
+
+  ctx.font = 'bold 18px "Courier New", monospace';
+  ctx.fillStyle = '#ff2a2a';
+  ctx.fillText('RAGE SCORE', W/2, 210);
+  ctx.font = 'bold 22px "Courier New", monospace';
+  ctx.fillStyle = '#ff6a4a';
+  ctx.fillText(String(rageScore), W/2, 232);
+
+  ctx.font = 'bold 10px "Courier New", monospace';
+  ctx.fillStyle = '#4a4a55';
+  ctx.fillText('PRESS R TO RUN IT AGAIN   •   ESC FOR STAGE SELECT', W/2, 288);
+
+  ctx.textAlign = 'left';
+}
+
+/* ============================================================
+   TIME FORMAT
+   ============================================================ */
+function fmtTime(t){
+  const m  = Math.floor(t / 60);
+  const s  = Math.floor(t % 60);
+  const ms = Math.floor((t % 1) * 1000);
+  return String(m).padStart(2,'0') + ':' +
+         String(s).padStart(2,'0') + '.' +
+         String(ms).padStart(3,'0');
 }
 
 /* ============================================================
